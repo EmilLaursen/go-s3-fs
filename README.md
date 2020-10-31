@@ -33,7 +33,7 @@ The required format is PEM with both the certificate and private key in a single
 
 Download packages from official pypi and private repository (with mTLS, with basic auth).
 ```
-pip install --client-cert <path> --extra-index-url https://eol:secret@localhost:8080 -r requirements.txt
+pip install --client-cert <path> --extra-index-url https://localhost:8080 -r requirements.txt
 ```
 Note the required format for the client certificate (like above):
 ```
@@ -75,9 +75,13 @@ We use a few rules to determine whether something is a file or directory.
 
 - [x] Enable uploads from pypi. They send multipart forms to root "/" on a post. Parse and uplaod this to s3.
 - [x] Test mTLS/client-cert authentication with pip install and poetry publish
+- [x] Dockerfile
+  - [x] Embed files into binary (favicon + certificates)
+- [x] Docker compose
 - [ ] Create CLI usage gif !
+- [ ] Create Kubernetes yaml (istio service)
 - [ ] Refactor codebase.
-- [ ] Docker compose
+  - [ ] minio.io integration test setup
 - [ ] tests
 - [x] Use some structured logging library
   - [ ] Remove uncesseary log messages, and convert useful ones to have proper key/values

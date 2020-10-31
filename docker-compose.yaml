@@ -1,0 +1,15 @@
+version: "3.7"
+
+
+services:
+  s3-fs:
+    build:
+      context: .
+      target: production
+      args:
+        GOOS: linux
+        GOAARCH: amd64
+    env_file:
+      - do.env
+    ports:
+      - "8080:8080"

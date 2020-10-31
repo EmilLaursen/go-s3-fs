@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/EmilLaursen/go-s3-fs/libraries/box"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -37,8 +38,7 @@ type Config struct {
 	BucketName string `envconfig:"BUCKET_NAME"`
 	Endpoint   string
 	Region     string
-	TLSCert    string `envconfig:"TLS_CERT"`
-	TLSKey     string `envconfig:"TLS_KEY"`
+	Port       string `default:"8080"`
 }
 
 func main() {
@@ -48,14 +48,15 @@ func main() {
 		log.Fatal().Err(err)
 	}
 
-	log.Printf("%+v", c)
-
 	// Setup logging
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Print("hello world")
-
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	log.Info().Str("foo", "bar").Msg("Hello world")
+	log.Printf("%+v", c)
+
+	// Check box for TLS certs
+	TLSCert, certOK := box.Get("/cert.pem")
+	TLSKey, keyOK := box.Get("/key.pem")
+	ClientCACert, cCertOk := box.Get("/client-ca.pem")
 
 	newSession, err := session.NewSession(
 		&aws.Config{
@@ -74,25 +75,31 @@ func main() {
 	}
 	r := s3fs.GetRouter()
 
-	if useTLS := len(c.TLSCert) > 0 && len(c.TLSKey) > 0; useTLS {
-		tlsConfig, err := GetTLSConfig(c)
+	var tlsConfig *tls.Config
+	useTLS := certOK && keyOK && cCertOk
+	if useTLS {
+		tlsConfig, err = GetTLSConfig(ClientCACert, TLSCert, TLSKey)
 		if err != nil {
 			log.Fatal().Err(err).Msg("TLS config failed")
 		}
 
-		server := &http.Server{
-			Addr:      ":8080",
-			Handler:   r,
-			TLSConfig: tlsConfig,
-		}
-		log.Fatal().Err(server.ListenAndServeTLS(c.TLSCert, c.TLSKey))
 	} else {
-		server := &http.Server{
-			Addr:    ":8080",
-			Handler: r,
-		}
-		log.Fatal().Err(server.ListenAndServe())
+		tlsConfig = nil
 	}
+
+	server := &http.Server{
+		Addr:      ":" + c.Port,
+		Handler:   r,
+		TLSConfig: tlsConfig,
+	}
+
+	if useTLS {
+		log.Info().Msg("Using TLS")
+		log.Fatal().Err(server.ListenAndServeTLS("", ""))
+		return
+	}
+	log.Fatal().Err(server.ListenAndServe())
+
 }
 
 var htmlReplacer = strings.NewReplacer(
@@ -413,14 +420,13 @@ func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *
 }
 
 func (sfs *S3FileServer) FaviconHandler(w http.ResponseWriter, r *http.Request) {
-	f, err := os.Open("favicon.ico")
-	if err != nil {
+	favicon, ok := box.Get("/favicon.ico")
+	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer f.Close()
 
-	if _, err = io.Copy(w, f); err != nil {
+	if _, err := io.Copy(w, bytes.NewReader(favicon)); err != nil {
 		log.Printf("Copy favicon error %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -440,21 +446,21 @@ func ConvertHexToBase64(hexEncoded string) (string, error) {
 	return base64.StdEncoding.EncodeToString(bytes), nil
 }
 
-func GetTLSConfig(c Config) (*tls.Config, error) {
-	// Create a CA certificate pool and add cert.pem to it
-	caCert, err := ioutil.ReadFile(c.TLSCert)
-	if err != nil {
-		log.Fatal().Err(err)
-		return nil, err
-	}
+func GetTLSConfig(caCert []byte, TLSCert []byte, TLSKey []byte) (*tls.Config, error) {
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(caCert)
 
+	certificate, err := tls.X509KeyPair(TLSCert, TLSKey)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create the TLS Config with the CA pool and enable Client certificate validation
 	tlsConfig := &tls.Config{
-		ClientCAs:          caCertPool,
-		ClientAuth:         tls.RequireAndVerifyClientCert,
-		InsecureSkipVerify: true,
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{certificate},
+		ClientCAs:    caCertPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 	tlsConfig.BuildNameToCertificate()
 	return tlsConfig, nil
