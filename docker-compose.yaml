@@ -8,8 +8,15 @@ services:
       target: production
       args:
         GOOS: linux
-        GOAARCH: amd64
+        GOARCH: amd64
     env_file:
       - do.env
     ports:
       - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128m
+        reservations:
+          memory: 128m

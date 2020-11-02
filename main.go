@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -21,14 +22,18 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	// _ "net/http/pprof"
+
 	"github.com/ante-dk/envconfig"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
 	"github.com/pkg/errors"
 )
 
@@ -36,12 +41,20 @@ type Config struct {
 	Key        string `envconfig:"SPACES_KEY"`
 	Secret     string `envconfig:"SPACES_SECRET"`
 	BucketName string `envconfig:"BUCKET_NAME"`
+	BasePath   string `envconfig:"BASE_PATH" default:"/"`
 	Endpoint   string
 	Region     string
 	Port       string `default:"8080"`
 }
 
+const Kb int = 1024
+const Mb int = Kb * Kb
+
 func main() {
+	// go func() {
+	// 	log.Fatal().Err(http.ListenAndServe(":6060", nil))
+	// }()
+
 	var c Config
 	err := envconfig.Process("", &c)
 	if err != nil {
@@ -58,6 +71,7 @@ func main() {
 	TLSKey, keyOK := box.Get("/key.pem")
 	ClientCACert, cCertOk := box.Get("/client-ca.pem")
 
+	// Setup S3 client session
 	newSession, err := session.NewSession(
 		&aws.Config{
 			Credentials: credentials.NewStaticCredentials(c.Key, c.Secret, ""),
@@ -69,11 +83,35 @@ func main() {
 		log.Fatal().Err(err)
 	}
 
+	s3Client := s3.New(newSession)
+
+	s3Downloader := s3manager.NewDownloaderWithClient(s3Client, func(d *s3manager.Downloader) {
+		d.BufferProvider = s3manager.NewPooledBufferedWriterReadFromProvider(256 * Kb)
+		d.Concurrency = 1
+		d.PartSize = int64(64 * Mb)
+	})
+
 	s3fs := S3FileServer{
-		BucketName: c.BucketName,
-		S3Client:   s3.New(newSession),
+		BucketName:   c.BucketName,
+		S3Client:     s3Client,
+		S3Downloader: s3Downloader,
+		BasePath:     c.BasePath,
 	}
+
 	r := s3fs.GetRouter()
+
+	baseRouter := chi.NewRouter()
+
+	baseRouter.Use(middleware.RequestID)
+	baseRouter.Use(middleware.RealIP)
+	baseRouter.Use(middleware.Recoverer)
+	baseRouter.Use(middleware.Timeout(60 * time.Second))
+
+	baseRouter.Mount(c.BasePath, r)
+
+	faviconRouter := chi.NewRouter()
+	faviconRouter.Get("/favicon.ico", FaviconHandler)
+	baseRouter.Mount("/", faviconRouter)
 
 	var tlsConfig *tls.Config
 	useTLS := certOK && keyOK && cCertOk
@@ -89,7 +127,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:      ":" + c.Port,
-		Handler:   r,
+		Handler:   baseRouter,
 		TLSConfig: tlsConfig,
 	}
 
@@ -121,28 +159,27 @@ type S3File struct {
 }
 
 type S3FileServer struct {
-	BucketName string
-	S3Client   *s3.S3
+	BucketName   string
+	S3Client     *s3.S3
+	S3Downloader *s3manager.Downloader
+	BasePath     string
 }
 
 func (sfs *S3FileServer) GetRouter() *chi.Mux {
 	r := chi.NewRouter()
-	// r.Use(middleware.BasicAuth("*.pypi.eol.dk", map[string]string{
-	// 	"eol": "secret",
-	// }))
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
-	r.Get("/favicon.ico", sfs.FaviconHandler)
 	r.Get("/*", sfs.S3Handler)
 	r.Post("/*", sfs.UploadHandler)
 	return r
 }
 
 func (sfs *S3FileServer) UploadHandler(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	urlPath := r.URL.Path
 	log.Printf("urlPath: %v", urlPath)
-	defer r.Body.Close()
-
-	// log.Printf("Headers: %+v", r.Header)
 
 	// 32mb in memory, rest on disk
 	parseErr := r.ParseMultipartForm(32 << 20)
@@ -154,6 +191,13 @@ func (sfs *S3FileServer) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	packageName := r.FormValue("name")
 	log.Debug().Msgf("Multipart-form name: %v", packageName)
+
+	if len(packageName) <= 0 {
+		log.Printf("Illegal multipart format. No name supplied.")
+		http.Error(w, "", http.StatusBadRequest)
+		return
+	}
+
 	f, fh, err := r.FormFile("content")
 	if err != nil {
 		log.Printf("FormFile content error: %+v", err)
@@ -184,7 +228,8 @@ func (sfs *S3FileServer) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("md5Digest: %v", base64Md5Digest)
 	log.Printf("size: %v", size)
 
-	_, err = sfs.S3Client.PutObject(
+	_, err = sfs.S3Client.PutObjectWithContext(
+		r.Context(),
 		&s3.PutObjectInput{
 			Bucket:             aws.String(sfs.BucketName),
 			Key:                aws.String(s3Destination),
@@ -200,19 +245,24 @@ func (sfs *S3FileServer) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
-	// log.Printf("putObject output: %+v", putOut)
 }
 
 func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 	urlPath := r.URL.Path
 	log.Printf("urlPath: %v", urlPath)
+	urlPath = strings.TrimPrefix(urlPath, sfs.BasePath)
+	log.Printf("urlPath trimmed BasePath: %v", urlPath)
+
+	if len(urlPath) <= 0 {
+		// Redirect host:port/BasePath to host:port/BasePath/
+		http.Redirect(w, r, r.URL.Path+"/", http.StatusSeeOther)
+		return
+	}
 
 	urlPath = strings.TrimPrefix(urlPath, "/")
-	// log.Printf("stripped urlPath: %v", urlPath)
 
 	isRoot := len(urlPath) <= 0
 	if isRoot {
-		log.Printf("isRoot: %v", isRoot)
 		sfs.ServeDirList(w, r, "")
 		return
 	}
@@ -229,14 +279,12 @@ func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s3file, err := sfs.LookupObjectKey(urlPath)
+	s3file, err := sfs.LookupObjectKey(r.Context(), urlPath)
 	if err != nil {
 		log.Printf("error: %v", err)
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 		return
 	}
-
-	log.Printf("s3file: %+v", s3file)
 
 	if s3file.IsDir {
 		// Folder was requested without trailing "/". We should redirect to path + "/"
@@ -247,15 +295,16 @@ func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 	sfs.ServeFile(w, r, s3file)
 }
 
-func (sfs *S3FileServer) LookupObjectKey(key string) (*S3File, error) {
+func (sfs *S3FileServer) LookupObjectKey(ctx context.Context, key string) (*S3File, error) {
 	log.Printf("Calling headobject: %v", key)
-	objectInfo, err := sfs.S3Client.HeadObject(
+	objectInfo, err := sfs.S3Client.HeadObjectWithContext(
+		ctx,
 		&s3.HeadObjectInput{
 			Bucket: aws.String(sfs.BucketName),
 			Key:    aws.String(key),
 		},
 	)
-	// log.Printf("Called headobject: %+v, %v", objectInfo, err)
+
 	if err != nil {
 		log.Printf("error: %+v", err)
 		if awsErr, ok := err.(awserr.Error); ok {
@@ -263,7 +312,8 @@ func (sfs *S3FileServer) LookupObjectKey(key string) (*S3File, error) {
 			case "NotFound":
 				// Could be a 'directory lookup' lacking trailing slash
 				// HeadObject does not handle these
-				spaces, err := sfs.S3Client.ListObjectsV2(
+				spaces, err := sfs.S3Client.ListObjectsV2WithContext(
+					ctx,
 					&s3.ListObjectsV2Input{
 						Bucket: aws.String(sfs.BucketName),
 						Prefix: aws.String(strings.TrimSuffix(key, "/") + "/"),
@@ -320,7 +370,8 @@ func (sfs *S3FileServer) LookupObjectKey(key string) (*S3File, error) {
 }
 
 func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, objectKey string) {
-	spaces, err := sfs.S3Client.ListObjectsV2(
+	spaces, err := sfs.S3Client.ListObjectsV2WithContext(
+		r.Context(),
 		&s3.ListObjectsV2Input{
 			Bucket: aws.String(sfs.BucketName),
 			Prefix: aws.String(objectKey),
@@ -358,7 +409,6 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 		if len(key) <= 0 {
 			continue
 		}
-		// log.Printf("trimmed key: %v", key)
 
 		split := strings.Split(strings.TrimPrefix(key, "/"), "/")
 
@@ -368,7 +418,6 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 			// stuff in subfolders get count > 1 (and root folder get count 0)
 			subFolder := split[0]
 			if _, ok := subFoldersSeen[subFolder]; !ok {
-				log.Printf("New subfolder! : %v", subFolder)
 				folderContent = append(folderContent, subFolder+"/")
 				subFoldersSeen[subFolder] = true
 			}
@@ -376,7 +425,6 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 
 		if len(split) == 1 {
 			file := split[0]
-			log.Printf("New file! : %v, key: '%v'", file, key)
 			folderContent = append(folderContent, file)
 		}
 
@@ -394,32 +442,56 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 	fmt.Fprintf(w, "</pre>\n")
 }
 
-func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *S3File) {
-	log.Printf("Downloading file %v", s3f.Key)
+type FakeWriterAt struct {
+	w io.Writer
+}
 
-	objOutput, err := sfs.S3Client.GetObject(&s3.GetObjectInput{
+func (fw FakeWriterAt) WriteAt(p []byte, offset int64) (n int, err error) {
+	// ignore 'offset' because we forced sequential downloads, with downloader.Concurrency = 1
+	return fw.w.Write(p)
+}
+
+func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *S3File) {
+	log.Printf("Serving file %v", s3f.Key)
+	defer r.Body.Close()
+
+	_, err := sfs.S3Downloader.DownloadWithContext(r.Context(), FakeWriterAt{w}, &s3.GetObjectInput{
 		Bucket: aws.String(s3f.BucketName),
 		Key:    aws.String(s3f.Key),
 	})
 	if err != nil {
-		log.Printf("GetObject error %v", err)
+		log.Printf("DownloadWithContext error %v", err)
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 		return
 	}
-	defer objOutput.Body.Close()
 
+	// objOutput, err := sfs.S3Client.GetObjectWithContext(r.Context(), &s3.GetObjectInput{
+	// 	Bucket: aws.String(s3f.BucketName),
+	// 	Key:    aws.String(s3f.Key),
+	// })
+	// if err != nil {
+	// 	log.Printf("GetObject error %v", err)
+	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
+	// 	return
+	// }
+	// defer objOutput.Body.Close()
+
+	// // 32 mega byte ? mibi byte?
+	// bufferSize := 32 * 1024
+	// buffer := make([]byte, bufferSize)
+
+	// if _, err := io.CopyBuffer(w, objOutput.Body, buffer); err != nil {
+	// 	log.Printf("Copy s3 object error %v", err)
+	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
+	// 	return
+	// }
 	w.Header().Add("Content-Type", s3f.ContentType)
 	w.Header().Add("Content-Length", strconv.FormatInt(s3f.ContentLength, 10))
 	w.Header().Add("Last-Modified", s3f.LastModified.String())
-
-	if _, err := io.Copy(w, objOutput.Body); err != nil {
-		log.Printf("Copy s3 object error %v", err)
-		http.Error(w, "404 Not Found", http.StatusNotFound)
-		return
-	}
 }
 
-func (sfs *S3FileServer) FaviconHandler(w http.ResponseWriter, r *http.Request) {
+func FaviconHandler(w http.ResponseWriter, r *http.Request) {
+	log.Info().Msg("/favicon.ico called !")
 	favicon, ok := box.Get("/favicon.ico")
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -431,7 +503,6 @@ func (sfs *S3FileServer) FaviconHandler(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	// log.Printf("Written %v bytes", written)
 }
 
 func StripSlashes(str string) string {
