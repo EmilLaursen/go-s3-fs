@@ -459,8 +459,15 @@ func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *
 		Bucket: aws.String(s3f.BucketName),
 		Key:    aws.String(s3f.Key),
 	})
+	ctxErr := r.Context().Err()
+	if ctxErr != nil {
+		log.Printf("DownloadWithContext, context cancelled error %v", ctxErr)
+		return
+	}
+
 	if err != nil {
 		log.Printf("DownloadWithContext error %v", err)
+
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 		return
 	}
