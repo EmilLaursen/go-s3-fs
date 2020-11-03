@@ -50,9 +50,9 @@ The required format is PEM with both the certificate and private key in a single
 
 ## Install packages (with pip)
 
-Download packages from official pypi and private repository (with mTLS, with basic auth).
+Download packages from official pypi and private repository.
 ```bash
-pip install --trusted-host localhost:8080 --client-cert <path> --extra-index-url http://localhost:8080 -r requirements.txt
+pip install --trusted-host localhost:8080 --extra-index-url http://localhost:8080 -r requirements.txt
 ```
 Note the required format for the client certificate (like above):
 
