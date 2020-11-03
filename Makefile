@@ -1,12 +1,11 @@
 .PHONY: generate
 
-# Do me!
 generate:
 	@go generate ./...
 	@echo -e "[\033[1;32mOK\033[0m] Files added to embed box!\n"
 
 security:
-	@gosec ./...
+	@gosec -quiet ./...
 	@echo -e "[\033[1;32mOK\033[0m] Go security check was completed!\n"
 
 docker-linux-amd64: security generate

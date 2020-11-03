@@ -38,9 +38,9 @@ import (
 )
 
 type Config struct {
-	Key        string `envconfig:"SPACES_KEY"`
-	Secret     string `envconfig:"SPACES_SECRET"`
-	BucketName string `envconfig:"BUCKET_NAME"`
+	Key        string `envconfig:"SPACES_KEY" required:"true"`
+	Secret     string `envconfig:"SPACES_SECRET" required:"true"`
+	BucketName string `envconfig:"BUCKET_NAME" required:"true"`
 	BasePath   string `envconfig:"BASE_PATH" default:"/"`
 	Endpoint   string
 	Region     string
