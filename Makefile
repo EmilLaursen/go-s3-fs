@@ -8,7 +8,7 @@ security:
 	@gosec -quiet ./...
 	@echo -e "[\033[1;32mOK\033[0m] Go security check was completed!\n"
 
-docker-linux-amd64: security generate
+docker-linux-amd64: security
 	@DOCKER_BUILDKIT=1 docker build --build-arg GOOS=linux --build-arg GOARCH=amd64 --target production -t gos3fs:latest .
 
 docker-linux-armv8: security
