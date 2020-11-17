@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -51,10 +53,6 @@ const Kb int = 1024
 const Mb int = Kb * Kb
 
 func main() {
-	// go func() {
-	// 	log.Fatal().Err(http.ListenAndServe(":6060", nil))
-	// }()
-
 	var c Config
 	err := envconfig.Process("", &c)
 	if err != nil {
@@ -83,20 +81,7 @@ func main() {
 		log.Fatal().Err(err)
 	}
 
-	s3Client := s3.New(newSession)
-
-	s3Downloader := s3manager.NewDownloaderWithClient(s3Client, func(d *s3manager.Downloader) {
-		d.BufferProvider = s3manager.NewPooledBufferedWriterReadFromProvider(256 * Kb)
-		d.Concurrency = 1
-		d.PartSize = int64(64 * Mb)
-	})
-
-	s3fs := S3FileServer{
-		BucketName:   c.BucketName,
-		S3Client:     s3Client,
-		S3Downloader: s3Downloader,
-		BasePath:     c.BasePath,
-	}
+	s3fs := NewS3FileServer(c.BucketName, c.BasePath, s3.New(newSession))
 
 	r := s3fs.GetRouter()
 
@@ -144,8 +129,6 @@ var htmlReplacer = strings.NewReplacer(
 	"&", "&amp;",
 	"<", "&lt;",
 	">", "&gt;",
-	// "&#34;" is shorter than "&quot;".
-	// "&#39;" is shorter than "&apos;" and apos was not in HTML until HTML5.
 	"'", "&#39;",
 )
 
@@ -162,7 +145,27 @@ type S3FileServer struct {
 	BucketName   string
 	S3Client     *s3.S3
 	S3Downloader *s3manager.Downloader
+	S3Uploader   *s3manager.Uploader
 	BasePath     string
+}
+
+func NewS3FileServer(BucketName, BasePath string, S3Client *s3.S3) S3FileServer {
+
+	s3Downloader := s3manager.NewDownloaderWithClient(S3Client, func(d *s3manager.Downloader) {
+		d.BufferProvider = s3manager.NewPooledBufferedWriterReadFromProvider(256 * Kb)
+		d.Concurrency = 1
+		d.PartSize = int64(64 * Mb)
+	})
+
+	s3Uploader := s3manager.NewUploaderWithClient(S3Client)
+
+	return S3FileServer{
+		BucketName:   BucketName,
+		S3Client:     S3Client,
+		S3Downloader: s3Downloader,
+		S3Uploader:   s3Uploader,
+		BasePath:     BasePath,
+	}
 }
 
 func (sfs *S3FileServer) GetRouter() *chi.Mux {
@@ -172,86 +175,106 @@ func (sfs *S3FileServer) GetRouter() *chi.Mux {
 	})
 
 	r.Get("/*", sfs.S3Handler)
-	r.Post("/*", sfs.UploadHandler)
+	r.Post("/*", sfs.StreamUploadHandler)
 	return r
 }
 
-func (sfs *S3FileServer) UploadHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	urlPath := r.URL.Path
-	log.Printf("urlPath: %v", urlPath)
+func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Request) {
 
-	// 32mb in memory, rest on disk
-	parseErr := r.ParseMultipartForm(32 << 20)
-	if parseErr != nil {
-		log.Printf("failed to parse multipart form: %+v", parseErr)
-		http.Error(w, "", http.StatusBadRequest)
-		return
-	}
-
-	packageName := r.FormValue("name")
-	log.Debug().Msgf("Multipart-form name: %v", packageName)
-
-	if len(packageName) <= 0 {
-		log.Printf("Illegal multipart format. No name supplied.")
-		http.Error(w, "", http.StatusBadRequest)
-		return
-	}
-
-	f, fh, err := r.FormFile("content")
+	mReader, err := r.MultipartReader()
 	if err != nil {
-		log.Printf("FormFile content error: %+v", err)
+		log.Printf("failed to create stream reader for multipart form: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
-	defer f.Close()
-	s3Destination := filepath.Join(packageName, fh.Filename)
-	contentType, err := mimetype.DetectReader(f)
+
+	// The fields we extract
+	metadataFields := NewStringSet("name", "md5_digest")
+	fileFields := NewStringSet("content")
+
+	metadata := make(map[string]string, metadataFields.Length())
+	var file *multipart.Part
+
+	nextPart, err := mReader.NextPart()
+	log.Printf("nextpart: %v, error: %v", nextPart, err)
+
+	for i := 0; err == nil && i < 50; i++ {
+		fname := nextPart.FormName()
+
+		if metadataFields.Contains(fname) {
+
+			bytes, readErr := ioutil.ReadAll(nextPart)
+			if readErr != nil {
+				log.Printf("failed to read next part bytes: %+v", err)
+				continue
+			}
+
+			metadata[nextPart.FormName()] = string(bytes)
+
+		} else if fileFields.Contains(nextPart.FormName()) {
+
+			file = nextPart
+			// must break otherwise the bytes are read, and the file is lost
+			break
+
+		} else {
+			nextPart.Close()
+		}
+
+		nextPart, err = mReader.NextPart()
+
+	}
+
+	base64Md5Digest, err := ConvertHexToBase64(metadata["md5_digest"])
+	if err != nil {
+		log.Printf("encode to base64 failed: %+v", err)
+		http.Error(w, "", http.StatusBadRequest)
+	}
+
+	// log.Printf("values: %+v", metadata)
+	// log.Printf("file: %v", file)
+
+	packageName := metadata["name"]
+	s3Destination := filepath.Join(packageName, file.FileName())
+
+	// peek mimetype from reader, and rebuild it
+	var mimetypeDetectionBytes bytes.Buffer
+	tReader := io.TeeReader(file, &mimetypeDetectionBytes)
+
+	contentType, err := mimetype.DetectReader(tReader)
 	if err != nil {
 		log.Printf("mimetype.DetectReader error: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 	}
 
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		log.Printf("f.Seek(0, io.SeekStart) error: %+v", err)
-		http.Error(w, "", http.StatusBadRequest)
-	}
+	body := io.MultiReader(&mimetypeDetectionBytes, file)
 
-	base64Md5Digest, err := ConvertHexToBase64(r.FormValue("md5_digest"))
-	if err != nil {
-		log.Printf("encode to base64 failed: %+v", err)
-		http.Error(w, "", http.StatusBadRequest)
-	}
-	size := fh.Size
 	log.Printf("S3Destination: %v", s3Destination)
 	log.Printf("contentType: %v", contentType.String())
 	log.Printf("md5Digest: %v", base64Md5Digest)
-	log.Printf("size: %v", size)
 
-	_, err = sfs.S3Client.PutObjectWithContext(
-		r.Context(),
-		&s3.PutObjectInput{
-			Bucket:             aws.String(sfs.BucketName),
-			Key:                aws.String(s3Destination),
-			Body:               f,
-			ContentMD5:         aws.String(base64Md5Digest),
-			ContentDisposition: aws.String(fmt.Sprintf(`attachment; filename="%s"`, fh.Filename)),
-			ContentLength:      aws.Int64(size),
-			ContentType:        aws.String(contentType.String()),
-		},
-	)
+	uploadOutput, err := sfs.S3Uploader.UploadWithContext(r.Context(), &s3manager.UploadInput{
+		Bucket:             aws.String(sfs.BucketName),
+		Key:                aws.String(s3Destination),
+		Body:               body,
+		ContentMD5:         aws.String(base64Md5Digest),
+		ContentDisposition: aws.String(fmt.Sprintf(`attachment; filename="%s"`, file.FileName())),
+		// ContentLength:      aws.Int64(fileSize),
+		ContentType: aws.String(contentType.String()),
+	})
 	if err != nil {
-		log.Printf("putObject error: %+v", err)
+		log.Printf("UploadWithContext error: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
+	log.Printf("uploaded %v to: %v", file.FileName(), uploadOutput.Location)
+
 }
 
 func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 	urlPath := r.URL.Path
-	log.Printf("urlPath: %v", urlPath)
+	log.Printf("called urlPath: %v", urlPath)
 	urlPath = strings.TrimPrefix(urlPath, sfs.BasePath)
-	log.Printf("urlPath trimmed BasePath: %v", urlPath)
 
 	if len(urlPath) <= 0 {
 		// Redirect host:port/BasePath to host:port/BasePath/
@@ -399,7 +422,9 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 	// This happens if you create a folder in the Digital Ocean GUI, or the AWS S3 gui.
 
 	// Simple set implementation
-	subFoldersSeen := make(map[string]bool)
+	subFoldersSeen := NewStringSet()
+
+	// make(map[string]bool)
 	folderContent := make([]string, 0)
 	for _, filekey := range spaces.Contents {
 		key := *filekey.Key
@@ -417,9 +442,9 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 			// files in current folder split to ['file_name'] --> count == 1
 			// stuff in subfolders get count > 1 (and root folder get count 0)
 			subFolder := split[0]
-			if _, ok := subFoldersSeen[subFolder]; !ok {
+			if !subFoldersSeen.Contains(subFolder) {
 				folderContent = append(folderContent, subFolder+"/")
-				subFoldersSeen[subFolder] = true
+				subFoldersSeen.Add(subFolder)
 			}
 		}
 
@@ -433,7 +458,23 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 		}
 	}
 
-	sort.SliceStable(folderContent, func(i, j int) bool { return folderContent[i] < folderContent[j] })
+	// make sure directories go on top
+	sort.SliceStable(folderContent, func(i, j int) bool {
+		fst := folderContent[i]
+		snd := folderContent[j]
+		if strings.HasSuffix(fst, "/") {
+			if strings.HasSuffix(snd, "/") {
+				return fst < snd
+			}
+			return true
+		}
+
+		if strings.HasSuffix(snd, "/") {
+			return false
+		}
+
+		return fst < snd
+	})
 
 	for _, key := range folderContent {
 		url := url.URL{Path: key}
@@ -455,12 +496,19 @@ func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *
 	log.Printf("Serving file %v", s3f.Key)
 	defer r.Body.Close()
 
+	w.Header().Add("Content-Type", s3f.ContentType)
+	w.Header().Add("Content-Length", strconv.FormatInt(s3f.ContentLength, 10))
+	w.Header().Add("Last-Modified", s3f.LastModified.String())
+
+	log.Printf("Content-type: %v", s3f.ContentType)
+	log.Printf("Content-Length: %v", strconv.FormatInt(s3f.ContentLength, 10))
+	log.Printf("Last-Modified: %v", s3f.LastModified.String())
+
 	_, err := sfs.S3Downloader.DownloadWithContext(r.Context(), FakeWriterAt{w}, &s3.GetObjectInput{
 		Bucket: aws.String(s3f.BucketName),
 		Key:    aws.String(s3f.Key),
 	})
-	ctxErr := r.Context().Err()
-	if ctxErr != nil {
+	if ctxErr := r.Context().Err(); ctxErr != nil {
 		log.Printf("DownloadWithContext, context cancelled error %v", ctxErr)
 		return
 	}
@@ -483,33 +531,59 @@ func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *
 	// }
 	// defer objOutput.Body.Close()
 
-	// // 32 mega byte ? mibi byte?
-	// bufferSize := 32 * 1024
-	// buffer := make([]byte, bufferSize)
-
-	// if _, err := io.CopyBuffer(w, objOutput.Body, buffer); err != nil {
+	// memoryBuffer := make([]byte, 256*Kb)
+	// if _, err = CopyBufferWithContext(r.Context(), w, objOutput.Body, memoryBuffer); err != nil {
 	// 	log.Printf("Copy s3 object error %v", err)
 	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
 	// 	return
 	// }
-	w.Header().Add("Content-Type", s3f.ContentType)
-	w.Header().Add("Content-Length", strconv.FormatInt(s3f.ContentLength, 10))
-	w.Header().Add("Last-Modified", s3f.LastModified.String())
+
 }
 
 func FaviconHandler(w http.ResponseWriter, r *http.Request) {
-	log.Info().Msg("/favicon.ico called !")
 	favicon, ok := box.Get("/favicon.ico")
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	defer r.Body.Close()
 
-	if _, err := io.Copy(w, bytes.NewReader(favicon)); err != nil {
+	if _, err := CopyBufferWithContext(r.Context(), w, bytes.NewReader(favicon), nil); err != nil {
 		log.Printf("Copy favicon error %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+}
+
+type StringSet struct {
+	set map[string]struct{}
+}
+
+func NewStringSet(elems ...string) StringSet {
+	set := StringSet{
+		set: make(map[string]struct{}),
+	}
+	for _, e := range elems {
+		set.Add(e)
+	}
+	return set
+}
+
+func (s *StringSet) Length() int {
+	return len(s.set)
+}
+
+func (s *StringSet) Add(e string) {
+	s.set[e] = struct{}{}
+}
+
+func (s *StringSet) Contains(e string) bool {
+	_, ok := s.set[e]
+	return ok
+}
+
+func (s *StringSet) Delete(e string) {
+	delete(s.set, e)
 }
 
 func StripSlashes(str string) string {
@@ -542,4 +616,38 @@ func GetTLSConfig(caCert []byte, TLSCert []byte, TLSKey []byte) (*tls.Config, er
 	}
 	tlsConfig.BuildNameToCertificate()
 	return tlsConfig, nil
+}
+
+// here is some syntaxic sugar inspired by the Tomas Senart's video,
+// it allows me to inline the Reader interface
+type readerFunc func(p []byte) (n int, err error)
+
+func (rf readerFunc) Read(p []byte) (n int, err error) { return rf(p) }
+
+// slightly modified function signature:
+// - context has been added in order to propagate cancelation
+// - I do not return the number of bytes written, has it is not useful in my use case
+func CopyBufferWithContext(ctx context.Context, dst io.Writer, src io.Reader, buf []byte) (int64, error) {
+	if buf == nil {
+		buf = make([]byte, 32*Kb)
+	}
+
+	// Copy will call the Reader and Writer interface multiple time, in order
+	// to copy by chunk (avoiding loading the whole file in memory).
+	// I insert the ability to cancel before read time as it is the earliest
+	// possible in the call process.
+	return io.CopyBuffer(dst, readerFunc(func(p []byte) (int, error) {
+
+		// golang non-blocking channel: https://gobyexample.com/non-blocking-channel-operations
+		select {
+
+		// if context has been canceled
+		case <-ctx.Done():
+			// stop process and propagate "context canceled" error
+			return 0, ctx.Err()
+		default:
+			// otherwise just run default io.Reader implementation
+			return src.Read(p)
+		}
+	}), buf)
 }
