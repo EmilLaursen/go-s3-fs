@@ -496,6 +496,14 @@ func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *
 	log.Printf("Serving file %v", s3f.Key)
 	defer r.Body.Close()
 
+	w.Header().Add("Content-Type", s3f.ContentType)
+	w.Header().Add("Content-Length", strconv.FormatInt(s3f.ContentLength, 10))
+	w.Header().Add("Last-Modified", s3f.LastModified.String())
+
+	log.Printf("Content-type: %v", s3f.ContentType)
+	log.Printf("Content-Length: %v", strconv.FormatInt(s3f.ContentLength, 10))
+	log.Printf("Last-Modified: %v", s3f.LastModified.String())
+
 	_, err := sfs.S3Downloader.DownloadWithContext(r.Context(), FakeWriterAt{w}, &s3.GetObjectInput{
 		Bucket: aws.String(s3f.BucketName),
 		Key:    aws.String(s3f.Key),
@@ -512,27 +520,23 @@ func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *
 		return
 	}
 
-	w.Header().Add("Content-Type", s3f.ContentType)
-	w.Header().Add("Content-Length", strconv.FormatInt(s3f.ContentLength, 10))
-	w.Header().Add("Last-Modified", s3f.LastModified.String())
+	// objOutput, err := sfs.S3Client.GetObjectWithContext(r.Context(), &s3.GetObjectInput{
+	// 	Bucket: aws.String(s3f.BucketName),
+	// 	Key:    aws.String(s3f.Key),
+	// })
+	// if err != nil {
+	// 	log.Printf("GetObject error %v", err)
+	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
+	// 	return
+	// }
+	// defer objOutput.Body.Close()
 
-	objOutput, err := sfs.S3Client.GetObjectWithContext(r.Context(), &s3.GetObjectInput{
-		Bucket: aws.String(s3f.BucketName),
-		Key:    aws.String(s3f.Key),
-	})
-	if err != nil {
-		log.Printf("GetObject error %v", err)
-		http.Error(w, "404 Not Found", http.StatusNotFound)
-		return
-	}
-	defer objOutput.Body.Close()
-
-	memoryBuffer := make([]byte, 256*Kb)
-	if _, err = CopyBufferWithContext(r.Context(), w, objOutput.Body, memoryBuffer); err != nil {
-		log.Printf("Copy s3 object error %v", err)
-		http.Error(w, "404 Not Found", http.StatusNotFound)
-		return
-	}
+	// memoryBuffer := make([]byte, 256*Kb)
+	// if _, err = CopyBufferWithContext(r.Context(), w, objOutput.Body, memoryBuffer); err != nil {
+	// 	log.Printf("Copy s3 object error %v", err)
+	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
+	// 	return
+	// }
 
 }
 
