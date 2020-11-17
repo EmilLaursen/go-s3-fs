@@ -61,8 +61,14 @@ func main() {
 
 	// Setup logging
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	log.Printf("%+v", c)
+	logger := zerolog.New(os.Stdout).With().Timestamp().Caller().Logger()
+
+	logger.Debug().
+		Str("Key", c.Key).
+		Str("BucketName", c.BucketName).
+		Str("BasePath", c.BasePath).
+		Str("Endpoint", c.Endpoint).
+		Str("Region", c.Region).Str("Port", c.Port)
 
 	// Check box for TLS certs
 	TLSCert, certOK := box.Get("/cert.pem")
@@ -78,10 +84,10 @@ func main() {
 		})
 
 	if err != nil {
-		log.Fatal().Err(err)
+		logger.Fatal().Err(err)
 	}
 
-	s3fs := NewS3FileServer(c.BucketName, c.BasePath, s3.New(newSession))
+	s3fs := NewS3FileServer(c.BucketName, c.BasePath, s3.New(newSession), logger)
 
 	r := s3fs.GetRouter()
 
@@ -147,9 +153,10 @@ type S3FileServer struct {
 	S3Downloader *s3manager.Downloader
 	S3Uploader   *s3manager.Uploader
 	BasePath     string
+	logger       zerolog.Logger
 }
 
-func NewS3FileServer(BucketName, BasePath string, S3Client *s3.S3) S3FileServer {
+func NewS3FileServer(BucketName, BasePath string, S3Client *s3.S3, logger zerolog.Logger) S3FileServer {
 
 	s3Downloader := s3manager.NewDownloaderWithClient(S3Client, func(d *s3manager.Downloader) {
 		d.BufferProvider = s3manager.NewPooledBufferedWriterReadFromProvider(256 * Kb)
@@ -165,6 +172,7 @@ func NewS3FileServer(BucketName, BasePath string, S3Client *s3.S3) S3FileServer 
 		S3Downloader: s3Downloader,
 		S3Uploader:   s3Uploader,
 		BasePath:     BasePath,
+		logger:       logger,
 	}
 }
 
@@ -180,10 +188,11 @@ func (sfs *S3FileServer) GetRouter() *chi.Mux {
 }
 
 func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Request) {
+	logger := sfs.logger.With().Str("reqID", middleware.GetReqID(r.Context())).Logger()
 
 	mReader, err := r.MultipartReader()
 	if err != nil {
-		log.Printf("failed to create stream reader for multipart form: %+v", err)
+		logger.Info().Msgf("failed to create stream reader for multipart form: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
@@ -196,7 +205,7 @@ func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Requ
 	var file *multipart.Part
 
 	nextPart, err := mReader.NextPart()
-	log.Printf("nextpart: %v, error: %v", nextPart, err)
+	logger.Debug().Msgf("nextpart: %v, error: %v", nextPart, err)
 
 	for i := 0; err == nil && i < 50; i++ {
 		fname := nextPart.FormName()
@@ -205,7 +214,7 @@ func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Requ
 
 			bytes, readErr := ioutil.ReadAll(nextPart)
 			if readErr != nil {
-				log.Printf("failed to read next part bytes: %+v", err)
+				logger.Info().Msgf("failed to read next part bytes: %+v", err)
 				continue
 			}
 
@@ -227,7 +236,7 @@ func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Requ
 
 	base64Md5Digest, err := ConvertHexToBase64(metadata["md5_digest"])
 	if err != nil {
-		log.Printf("encode to base64 failed: %+v", err)
+		logger.Info().Msgf("encode to base64 failed: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 	}
 
@@ -243,15 +252,15 @@ func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Requ
 
 	contentType, err := mimetype.DetectReader(tReader)
 	if err != nil {
-		log.Printf("mimetype.DetectReader error: %+v", err)
+		logger.Info().Msgf("mimetype.DetectReader error: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 	}
 
 	body := io.MultiReader(&mimetypeDetectionBytes, file)
 
-	log.Printf("S3Destination: %v", s3Destination)
-	log.Printf("contentType: %v", contentType.String())
-	log.Printf("md5Digest: %v", base64Md5Digest)
+	logger.Debug().Msgf("S3Destination: %v", s3Destination)
+	logger.Debug().Msgf("contentType: %v", contentType.String())
+	logger.Debug().Msgf("md5Digest: %v", base64Md5Digest)
 
 	uploadOutput, err := sfs.S3Uploader.UploadWithContext(r.Context(), &s3manager.UploadInput{
 		Bucket:             aws.String(sfs.BucketName),
@@ -263,17 +272,19 @@ func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Requ
 		ContentType: aws.String(contentType.String()),
 	})
 	if err != nil {
-		log.Printf("UploadWithContext error: %+v", err)
+		logger.Info().Msgf("UploadWithContext error: %+v", err)
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
-	log.Printf("uploaded %v to: %v", file.FileName(), uploadOutput.Location)
+	logger.Debug().Msgf("uploaded %v to: %v", file.FileName(), uploadOutput.Location)
 
 }
 
 func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
+	logger := sfs.logger.With().Str("reqID", middleware.GetReqID(r.Context())).Logger()
+
 	urlPath := r.URL.Path
-	log.Printf("called urlPath: %v", urlPath)
+	logger.Debug().Msgf("called urlPath: %v", urlPath)
 	urlPath = strings.TrimPrefix(urlPath, sfs.BasePath)
 
 	if len(urlPath) <= 0 {
@@ -292,7 +303,7 @@ func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 
 	isIndexHtml := strings.HasSuffix(urlPath, "index.html")
 	if isIndexHtml {
-		log.Printf("isIndexHtml: %v", urlPath)
+		logger.Debug().Msgf("isIndexHtml: %v", urlPath)
 		urlPath = strings.TrimSuffix(urlPath, "index.html")
 		urlPath = StripSlashes(urlPath)
 	}
@@ -304,7 +315,7 @@ func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 
 	s3file, err := sfs.LookupObjectKey(r.Context(), urlPath)
 	if err != nil {
-		log.Printf("error: %v", err)
+		logger.Warn().Err(err)
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 		return
 	}
@@ -319,7 +330,9 @@ func (sfs *S3FileServer) S3Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sfs *S3FileServer) LookupObjectKey(ctx context.Context, key string) (*S3File, error) {
-	log.Printf("Calling headobject: %v", key)
+	logger := sfs.logger.With().Str("reqID", middleware.GetReqID(ctx)).Logger()
+
+	logger.Debug().Msgf("Calling headobject: %v", key)
 	objectInfo, err := sfs.S3Client.HeadObjectWithContext(
 		ctx,
 		&s3.HeadObjectInput{
@@ -329,7 +342,7 @@ func (sfs *S3FileServer) LookupObjectKey(ctx context.Context, key string) (*S3Fi
 	)
 
 	if err != nil {
-		log.Printf("error: %+v", err)
+		logger.Warn().Err(err)
 		if awsErr, ok := err.(awserr.Error); ok {
 			switch errCode := awsErr.Code(); errCode {
 			case "NotFound":
@@ -343,10 +356,10 @@ func (sfs *S3FileServer) LookupObjectKey(ctx context.Context, key string) (*S3Fi
 					},
 				)
 				if err != nil {
-					log.Printf("LookupObjectKey, ListObjectsV2 error: %v", awsErr.Code())
+					logger.Warn().Err(awsErr).Msg(awsErr.Code())
 				}
 
-				log.Printf("LookupObjectKey, ListObjectsV2(%v, %v): %+v", sfs.BucketName, key, spaces)
+				logger.Debug().Str("bucket", sfs.BucketName).Str("key", key).Str("spaces", spaces.String())
 				if len(spaces.Contents) > 0 {
 					return &S3File{
 						BucketName:    sfs.BucketName,
@@ -360,7 +373,7 @@ func (sfs *S3FileServer) LookupObjectKey(ctx context.Context, key string) (*S3Fi
 
 				return nil, errors.Wrap(awsErr, "Unexpected HeadObject awserr")
 			default:
-				log.Printf("default: %v", awsErr.Code())
+				logger.Warn().Err(awsErr).Msgf("default: %v", awsErr.Code())
 				return nil, errors.Wrap(awsErr, "Unexpected HeadObject awserr")
 			}
 		}
@@ -393,6 +406,8 @@ func (sfs *S3FileServer) LookupObjectKey(ctx context.Context, key string) (*S3Fi
 }
 
 func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, objectKey string) {
+	logger := sfs.logger.With().Str("reqID", middleware.GetReqID(r.Context())).Logger()
+
 	spaces, err := sfs.S3Client.ListObjectsV2WithContext(
 		r.Context(),
 		&s3.ListObjectsV2Input{
@@ -401,7 +416,7 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 		},
 	)
 	if err != nil || len(spaces.Contents) <= 0 {
-		log.Printf("ListObjectsV2 error: %+v", err)
+		logger.Warn().Err(err)
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 		return
 	}
@@ -454,7 +469,7 @@ func (sfs *S3FileServer) ServeDirList(w http.ResponseWriter, r *http.Request, ob
 		}
 
 		if len(split) == 0 {
-			log.Printf("!!!! WTF !! SPLIT HAS LENGTH 0: %v", key)
+			logger.Error().Str("key", key).Msgf("!!!! WTF !! SPLIT HAS LENGTH 0")
 		}
 	}
 
@@ -493,54 +508,38 @@ func (fw FakeWriterAt) WriteAt(p []byte, offset int64) (n int, err error) {
 }
 
 func (sfs *S3FileServer) ServeFile(w http.ResponseWriter, r *http.Request, s3f *S3File) {
-	log.Printf("Serving file %v", s3f.Key)
+	logger := sfs.logger.With().Str("reqID", middleware.GetReqID(r.Context())).Logger()
+
+	logger.Debug().Msgf("Serving file %v", s3f.Key)
 	defer r.Body.Close()
 
 	w.Header().Add("Content-Type", s3f.ContentType)
 	w.Header().Add("Content-Length", strconv.FormatInt(s3f.ContentLength, 10))
 	w.Header().Add("Last-Modified", s3f.LastModified.String())
 
-	log.Printf("Content-type: %v", s3f.ContentType)
-	log.Printf("Content-Length: %v", strconv.FormatInt(s3f.ContentLength, 10))
-	log.Printf("Last-Modified: %v", s3f.LastModified.String())
+	logger.Debug().Msgf("Content-type: %v", s3f.ContentType)
+	logger.Debug().Msgf("Content-Length: %v", strconv.FormatInt(s3f.ContentLength, 10))
+	logger.Debug().Msgf("Last-Modified: %v", s3f.LastModified.String())
 
 	_, err := sfs.S3Downloader.DownloadWithContext(r.Context(), FakeWriterAt{w}, &s3.GetObjectInput{
 		Bucket: aws.String(s3f.BucketName),
 		Key:    aws.String(s3f.Key),
 	})
 	if ctxErr := r.Context().Err(); ctxErr != nil {
-		log.Printf("DownloadWithContext, context cancelled error %v", ctxErr)
+		logger.Error().Err(ctxErr)
 		return
 	}
 
 	if err != nil {
-		log.Printf("DownloadWithContext error %v", err)
-
+		logger.Error().Err(err)
 		http.Error(w, "404 Not Found", http.StatusNotFound)
 		return
 	}
-
-	// objOutput, err := sfs.S3Client.GetObjectWithContext(r.Context(), &s3.GetObjectInput{
-	// 	Bucket: aws.String(s3f.BucketName),
-	// 	Key:    aws.String(s3f.Key),
-	// })
-	// if err != nil {
-	// 	log.Printf("GetObject error %v", err)
-	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
-	// 	return
-	// }
-	// defer objOutput.Body.Close()
-
-	// memoryBuffer := make([]byte, 256*Kb)
-	// if _, err = CopyBufferWithContext(r.Context(), w, objOutput.Body, memoryBuffer); err != nil {
-	// 	log.Printf("Copy s3 object error %v", err)
-	// 	http.Error(w, "404 Not Found", http.StatusNotFound)
-	// 	return
-	// }
-
 }
 
 func FaviconHandler(w http.ResponseWriter, r *http.Request) {
+	logger := log.With().Timestamp().Str("reqID", middleware.GetReqID(r.Context())).Logger()
+
 	favicon, ok := box.Get("/favicon.ico")
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -549,7 +548,7 @@ func FaviconHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	if _, err := CopyBufferWithContext(r.Context(), w, bytes.NewReader(favicon), nil); err != nil {
-		log.Printf("Copy favicon error %v", err)
+		logger.Error().Err(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
