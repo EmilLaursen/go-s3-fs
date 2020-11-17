@@ -31,7 +31,7 @@ COPY --from=builder /app/gos3fs /gos3fs
 COPY --from=download-dependencies /go/bin/reflex /reflex
 
 # "/go/bin/reflex", "-rsv", "\\.go$", 
-ENTRYPOINT ["/reflex", "-vsr", "\\.go$", "--", "sh", "-c", "go run main.go"]
+ENTRYPOINT ["/reflex", "-vsr", "\\.go$", "--", "sh", "-c", "go build -o gos3fs main.go && /gos3fs"]
 
 # Now copy it into our base image.
 FROM gcr.io/distroless/base-debian10 as production
