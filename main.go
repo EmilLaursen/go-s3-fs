@@ -227,7 +227,10 @@ func (sfs *S3FileServer) StreamUploadHandler(w http.ResponseWriter, r *http.Requ
 			break
 
 		} else {
-			nextPart.Close()
+			err := nextPart.Close()
+			if err != nil {
+				logger.Err(err)
+			}
 		}
 
 		nextPart, err = mReader.NextPart()
